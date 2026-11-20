@@ -1,0 +1,9 @@
+{
+  "recording": "pump-west",
+  "window": [0, 2],
+  "samples": [
+    {"slot": "a", "amplitude": 7},
+    {"slot": "b", "amplitude": 11}
+  ],
+  "replacement": {"amplitude": 19}
+}
