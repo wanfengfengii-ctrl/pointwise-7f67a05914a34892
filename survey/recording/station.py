@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from survey.capture.accept import PollResult, poll
+from survey.capture.accept import PollResult, cancel_overwrite, poll
 from survey.capture.candidates import CandidateFrame, OverwriteRequest, PollJournal, RecordingEvent
 from survey.capture.custody import CustodyStore
 from survey.capture.frontier import AcceptedEdition, EditionFrontier
@@ -46,6 +46,9 @@ class Station:
              fail_custody_commit: bool = False) -> PollResult:
         return poll(self, recording, event, operation, pause_before_overwrite=pause_before_overwrite,
                     lose_overwrite_reply=lose_overwrite_reply, fail_custody_commit=fail_custody_commit)
+
+    def cancel_overwrite(self, recording: str, operation: str) -> PollResult:
+        return cancel_overwrite(self, recording, operation)
 
     def issue(self, recording: str, edition: int, window: FrameWindow, operation: str) -> IssuedTicket:
         return issue(self, recording, edition, window, operation)

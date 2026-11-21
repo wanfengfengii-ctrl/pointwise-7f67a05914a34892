@@ -49,6 +49,17 @@ class RecordingEvent:
         return json.dumps([declarations, replacement], separators=(',', ':'))
 
 
+def declared_references(manifest: str) -> tuple[FrameRef, ...]:
+    """The explicit original frames a stored declaration adopts."""
+    declarations, _ = json.loads(manifest)
+    return tuple(FrameRef(*fields) for _, fields in declarations)
+
+
+def replacement_checksum(manifest: str) -> str | None:
+    _, replacement = json.loads(manifest)
+    return None if replacement is None else replacement[3]
+
+
 @dataclass(frozen=True)
 class PollRecord:
     operation: str
@@ -58,6 +69,24 @@ class PollRecord:
     keeps_expected: bool
     state: str
     edition: int | None
+
+    def check_request(self, recording: str, manifest: str) -> None:
+        if (self.recording, self.manifest) != (recording, manifest):
+            raise RequestConflict(f'poll operation {self.operation!r} has different parameters')
+
+    def declared_references(self) -> tuple[FrameRef, ...]:
+        return declared_references(self.manifest)
+
+    def replacement_checksum(self) -> str | None:
+        return replacement_checksum(self.manifest)
+
+
+@dataclass(frozen=True)
+class CancelRecord:
+    operation: str
+    recording: str
+    manifest: str
+    expected: FrameRef
 
     def check_request(self, recording: str, manifest: str) -> None:
         if (self.recording, self.manifest) != (recording, manifest):
@@ -76,6 +105,12 @@ class PollJournal:
         return PollRecord(operation, row['recording'], row['manifest'], expected,
                           bool(row['keeps_expected']), row['state'], row['edition'])
 
+    def load_cancel(self, operation: str) -> CancelRecord | None:
+        row = self.conn.execute('SELECT * FROM capture_cancels WHERE operation = ?', (operation,)).fetchone()
+        if row is None:
+            return None
+        return CancelRecord(operation, row['recording'], row['manifest'], FrameRef(*json.loads(row['expected'])))
+
     def stage(self, operation: str, recording: str, manifest: str,
               expected: FrameRef | None, keeps_expected: bool) -> None:
         expected_data = None if expected is None else json.dumps(expected.fields())
@@ -83,6 +118,14 @@ class PollJournal:
             (operation, recording, manifest, expected, keeps_expected, state, edition)
             VALUES (?, ?, ?, ?, ?, 'staged', NULL)''',
             (operation, recording, manifest, expected_data, int(keeps_expected)),
+        )
+
+    def record_cancel(self, operation: str, recording: str, manifest: str, expected: FrameRef) -> None:
+        """Replace a withdrawn candidate with a persistent cancellation terminal."""
+        self.conn.execute('DELETE FROM capture_poll WHERE operation = ?', (operation,))
+        self.conn.execute('''INSERT INTO capture_cancels (operation, recording, manifest, expected)
+            VALUES (?, ?, ?, ?)''',
+            (operation, recording, manifest, json.dumps(expected.fields())),
         )
 
     def mark_prepared(self, operation: str) -> None:
@@ -99,10 +142,20 @@ class PollJournal:
         if cursor.rowcount != 1:
             raise RuntimeError('poll has no publishable candidate')
 
-    def pending_overwrites(self) -> tuple[str, ...]:
-        rows = self.conn.execute('''SELECT operation FROM capture_poll
-            WHERE expected IS NOT NULL AND state <> 'published' ORDER BY operation''')
-        return tuple(row['operation'] for row in rows)
+    def pending_overwrites(self, recording: str | None = None,
+                           exclude: str | None = None) -> tuple[PollRecord, ...]:
+        query = '''SELECT operation FROM capture_poll
+            WHERE expected IS NOT NULL AND state IN ('staged', 'prepared')'''
+        params: list = []
+        if recording is not None:
+            query += ' AND recording = ?'
+            params.append(recording)
+        if exclude is not None:
+            query += ' AND operation <> ?'
+            params.append(exclude)
+        query += ' ORDER BY operation'
+        rows = self.conn.execute(query, params)
+        return tuple(self.load(row['operation']) for row in rows)
 
     @staticmethod
     def install(conn: Connection) -> None:
@@ -112,5 +165,10 @@ class PollJournal:
             state TEXT NOT NULL CHECK(state IN ('staged', 'prepared', 'published')),
             edition INTEGER, CHECK((state = 'published') = (edition IS NOT NULL))
         )''')
-        conn.execute('''CREATE UNIQUE INDEX IF NOT EXISTS one_unsettled_overwrite
-            ON capture_poll ((1)) WHERE expected IS NOT NULL AND state <> 'published' ''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS capture_cancels (
+            operation TEXT PRIMARY KEY, recording TEXT NOT NULL REFERENCES recording_plans(recording),
+            manifest TEXT NOT NULL, expected TEXT NOT NULL
+        )''')
+        conn.execute('DROP INDEX IF EXISTS one_unsettled_overwrite')
+        conn.execute('''CREATE UNIQUE INDEX IF NOT EXISTS one_unsettled_overwrite_per_recording
+            ON capture_poll (recording) WHERE expected IS NOT NULL AND state IN ('staged', 'prepared')''')

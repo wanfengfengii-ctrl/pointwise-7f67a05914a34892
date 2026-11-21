@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from sqlite3 import Connection
 from typing import TYPE_CHECKING
 
-from survey.capture.overwrite import has_pending_overwrites
+from survey.capture.overwrite import heal_cancellations, obligations
 from survey.device.slots import FrameUnavailable
 from survey.recording.coordinates import FrameWindow, require_name
 from survey.recording.plan import RecordingPlan, load_plan, save_plan, validate_plan
@@ -64,11 +64,14 @@ def close(station: Station, recording: str, operation: str) -> CloseResult:
         if stage == 'closed':
             station.requests.record_close(operation, recording, 'closed')
             return CloseResult(recording, 'closed')
-        if has_pending_overwrites(station.journal):
+        heal_cancellations(station.journal, station.recorder)
+        if station.journal.pending_overwrites():
             station.requests.record_close(operation, recording, 'pending')
             return CloseResult(recording, 'pending')
         try:
-            for reference in station.frontier.referenced_occurrences():
+            # Keep every obligation redeemable off the live port: published
+            # originals, unsettled candidates and written-but-unpublished frames.
+            for reference in obligations(station.journal, station.frontier, station.recorder):
                 station.custody.preserve(reference)
         except (FrameUnavailable, ValueError):
             station.requests.record_close(operation, recording, 'pending')

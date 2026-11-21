@@ -1,6 +1,6 @@
 from sqlite3 import Connection
 
-from survey.device.operations import DeviceOperations, OverwriteOutcome
+from survey.device.operations import CancelledOutcome, DeviceOperations, OverwriteOutcome
 from survey.device.readout import frame_checksum, read_occurrence
 from survey.device.slots import DeviceSlotStore, FrameOccurrence, FrameRef, FrameUnavailable
 from survey.recording.coordinates import require_name
@@ -10,6 +10,10 @@ from survey.recording.transactions import StationDatabase
 
 class OverwriteReplyLost(RuntimeError):
     """The device committed the overwrite before its reply was lost."""
+
+
+class OverwriteWithdrawn(RuntimeError):
+    """A late overwrite command arrived after the operation was withdrawn."""
 
 
 class Recorder:
@@ -50,6 +54,10 @@ class Recorder:
         if checksum != frame_checksum(amplitude):
             raise ValueError('bad replacement checksum')
         with self.db.atomic():
+            withdrawn = self.operations.lookup_cancel(operation)
+            if withdrawn is not None:
+                self.check_cancel(withdrawn, expected, checksum)
+                raise OverwriteWithdrawn(f'overwrite {operation!r} was withdrawn before it reached the device')
             prior = self.operation_outcome(operation)
             if prior is not None:
                 self.check_outcome(prior, expected, checksum)
@@ -64,6 +72,26 @@ class Recorder:
             raise OverwriteReplyLost(operation)
         return outcome
 
+    def withdraw(self, operation: str, expected: FrameRef, checksum: str) -> CancelledOutcome | None:
+        """Record the device terminal for a withdrawal that preceded any write.
+
+        Commits on its own so the terminal outlives a later station settlement
+        failure.  Returns ``None`` when the device already executed this
+        operation, so the caller settles it as a completed overwrite instead.
+        """
+        require_name(operation)
+        with self.db.atomic():
+            prior = self.operation_outcome(operation)
+            if prior is not None:
+                return None
+            existing = self.operations.lookup_cancel(operation)
+            if existing is not None:
+                self.check_cancel(existing, expected, checksum)
+                return existing
+            cancelled = CancelledOutcome(operation, expected, checksum)
+            self.operations.record_cancelled(cancelled)
+        return cancelled
+
     @staticmethod
     def check_outcome(outcome: OverwriteOutcome, expected: FrameRef, checksum: str) -> None:
         if (outcome.replaced_occurrence, outcome.replacement.slot, outcome.replacement.checksum) != (
@@ -71,8 +99,16 @@ class Recorder:
         ):
             raise RequestConflict(f'overwrite {outcome.operation!r} has a different device outcome')
 
+    @staticmethod
+    def check_cancel(cancelled: CancelledOutcome, expected: FrameRef, checksum: str) -> None:
+        if (cancelled.expected, cancelled.checksum) != (expected, checksum):
+            raise RequestConflict(f'overwrite {cancelled.operation!r} has a different withdrawal')
+
     def operation_outcome(self, operation: str) -> OverwriteOutcome | None:
         return self.operations.lookup(operation)
+
+    def cancellation_outcome(self, operation: str) -> CancelledOutcome | None:
+        return self.operations.lookup_cancel(operation)
 
     def overwrite_count(self) -> int:
         return self.operations.count()
